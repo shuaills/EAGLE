@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from torch import nn, optim
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
+import torch.distributed.checkpoint as dist_cp
 from tqdm import tqdm
 import wandb
 import torch.distributed as dist
@@ -40,6 +41,7 @@ assistant_template = "<|header_start|>assistant<|header_end|>\n\n"
 def parse_args():
     parser = argparse.ArgumentParser(description='eagle3')
     parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--num_epochs", type=int, default=40)
     parser.add_argument("--max_len", type=int, default=2048)
     parser.add_argument("--config_path", type=str, default="config.json")
@@ -53,14 +55,16 @@ def parse_args():
 
 
 def init_wandb(args):
-    wandb.login()
+    wandb.login(key="d38075491c84c0774138377d6ff2e94befa16324")
     wandb.init(project="eagle-llama4-sample", config=args)
 
 
 def init_distributed():
     from datetime import timedelta
     dist.init_process_group(backend="nccl", timeout=timedelta(hours=3))
-    torch.cuda.set_device(dist.get_rank())
+    local_rank = dist.get_rank() % torch.cuda.device_count()
+    print(f"binding the process to GPU {local_rank}")
+    torch.cuda.set_device(local_rank)
 
 def build_dataset_rank(
         tokenizer, datapath
@@ -300,7 +304,7 @@ def main():
     config = EConfig.from_pretrained(args.config_path)
     
     # build target model
-    llama4_config = Llama4TextConfig.from_pretrained("/tmp/Llama-4-Scout-17B-16E-Instruct")
+    llama4_config = Llama4TextConfig.from_pretrained(args.basepath)
     with torch.device("meta"):
         target_model = Llama4ForCausalLM(llama4_config).to(torch.bfloat16)
 
@@ -320,16 +324,15 @@ def main():
         sharding_strategy=ShardingStrategy.FULL_SHARD,
         device_id=torch.cuda.current_device(),
     )
-    dist.barrier()
+    print("finished wrapping fsdp")
 
     dict = load_checkpoint(args.basepath)
     
     # cfg = FullStateDictConfig(rank0_only=True)
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
         model.load_state_dict(dict, strict=False)
-    dist.barrier()
     model = model.cuda()
-
+    print("finished loading checkpoint")
     
     with rank_0_priority():
         model.scandata(args.trainpath, args.basepath, user_template, assistant_template)
@@ -338,9 +341,9 @@ def main():
     # build loss, optimizer, lr scheduler
     criterion = nn.SmoothL1Loss(reduction="none")
     num_epochs = args.num_epochs
-    optimizer = AdamW(model.parameters(), lr=1e-4)
+    optimizer = AdamW(model.parameters(), lr=args.learning_rate)
     total_steps = len(train_loader) * num_epochs
-    warmup_steps = int(total_steps * 0.02)
+    warmup_steps = int(total_steps * 0.015)
     scheduler = CosineAnnealingWarmupLR(optimizer, total_steps=total_steps, warmup_steps=warmup_steps)
 
     # build dataloaders
@@ -443,14 +446,23 @@ def main():
         # TODO: make this an argument
         if epoch % 1 == 0:
             # Save the draft model to CHECKPOINT_DIR
-            state_dict = {}
-            for name, param in model.named_parameters():
-                if "target" not in name:
-                    state_dict[name] = param.data
+            with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
+                state_dict = {
+                    "model": model.state_dict(),
+                }
 
-            if dist.get_rank() == 0:
-                torch.save(state_dict, f"{args.savedir}/model_{epoch}.pth")
-            dist.barrier()
+                param_keys = list(state_dict['model'].keys())
+
+                for param_key in param_keys:
+                    if "target" in param_key:
+                        state_dict['model'].pop(param_key)
+
+                ckpt_dir = f"{args.savedir}/epoch_{epoch}"
+                os.makedirs(ckpt_dir, exist_ok=True)
+                dist_cp.save_state_dict(
+                    state_dict=state_dict,
+                    storage_writer=dist_cp.FileSystemWriter(ckpt_dir),
+                )
 
 if __name__ == "__main__":
     main()

@@ -1,3 +1,4 @@
 cache.pt
 wandb/
 output/
+*.txt
