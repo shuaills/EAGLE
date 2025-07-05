@@ -34,8 +34,8 @@ set_seed(0)
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
-user_template = "<|eot|><|header_start|>user<|header_end|>"
-assistant_template = "<|eot|><|header_start|>assistant<|header_end|>\n\n"
+user_template = "<|header_start|>user<|header_end|>"
+assistant_template = "<|header_start|>assistant<|header_end|>\n\n"
 
 def parse_args():
     parser = argparse.ArgumentParser(description='eagle3')
