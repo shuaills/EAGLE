@@ -586,7 +586,6 @@ class Model(nn.Module):
                     if not tokenizer.pad_token_id:
                         tokenizer.pad_token_id = tokenizer.unk_token_id
 
-                    # 使用优雅的sglang风格方法生成loss_mask
                     encoding = tokenizer(
                         conversation,
                         return_tensors="pt",
