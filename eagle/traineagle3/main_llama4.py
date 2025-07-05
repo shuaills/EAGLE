@@ -109,53 +109,38 @@ def build_dataset_rank(
             if not tokenizer.pad_token_id:
                 tokenizer.pad_token_id = tokenizer.unk_token_id
 
-            input_ids = tokenizer(
+            encoding = tokenizer(
                 conversation,
                 return_tensors="pt",
                 max_length=2048,
                 add_special_tokens=False,
-            ).input_ids[0]
-            loss_mask = torch.ones_like(input_ids)
+                return_offsets_mapping=True,
+                truncation=True,
+            )
+            input_ids = encoding.input_ids[0]
+            offsets = encoding.offset_mapping[0]
+            loss_mask = torch.zeros_like(input_ids)
+            
+            assistant_header = "<|header_start|>assistant<|header_end|>\n\n"
+            user_header = "<|header_start|>user<|header_end|>"
+            end_of_turn_token = "<|eot|>"
 
-            sep = assistant_template
+            
+            assistant_pattern = (
+                re.escape(assistant_header) + r"(.*?)(?=" + re.escape(user_header) + "|" + re.escape(end_of_turn_token) + "|$)"
+            )
+            
+            for match in re.finditer(assistant_pattern, conversation, re.DOTALL):
+                assistant_start_char = match.start(1)
+                assistant_end_char = match.end(1)
+                
+                for idx, (token_start, token_end) in enumerate(offsets):
+                    if token_end <= assistant_start_char:
+                        continue
+                    if token_start >= assistant_end_char:
+                        continue
+                    loss_mask[idx] = 1
 
-            total_len = len(input_ids)
-
-            sep2 = user_template
-            turns = conversation.split(sep2)
-
-            turns[1] = turns[0] + sep2 + turns[1]
-            turns = turns[1:]
-
-            cur_len = 1
-            loss_mask[:cur_len] = 0
-            for i, turn in enumerate(turns):
-                if turn == "":
-                    break
-                turn_len = len(tokenizer(turn).input_ids)
-
-                parts = turn.split(sep)
-                if len(parts) != 2:
-                    break
-                parts[0] += sep
-                # "-2" is hardcoded for the Llama tokenizer to make the offset correct.
-                instruction_len = len(tokenizer(parts[0]).input_ids) - 1
-
-                # Ignore the user instructions
-                if i == 0:
-                    loss_mask[cur_len: cur_len + instruction_len - 2] = 0
-                else:
-                    loss_mask[cur_len - 3: cur_len + instruction_len + 1] = 0
-                cur_len += turn_len
-                if i != 0:
-                    cur_len += 3
-                # cur_len+=2
-
-                # if i != 0 and not tokenizer.legacy:
-                #     # The legacy and non-legacy modes handle special tokens differently
-                #     cur_len -= 1
-
-            loss_mask[cur_len:] = 0
             attention_mask = torch.ones_like(loss_mask)
 
             # new_examples["conversation"].append(conversation)
