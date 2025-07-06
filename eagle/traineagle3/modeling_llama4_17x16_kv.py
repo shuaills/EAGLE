@@ -331,7 +331,7 @@ class Llama4TextAttention(nn.Module):
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-        past_key_value = None
+        # past_key_value = None
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -355,7 +355,7 @@ class Llama4TextAttention(nn.Module):
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+        return attn_output, attn_weights, past_key_value
 
 
 class Llama4TextDecoderLayer(nn.Module):
@@ -398,7 +398,7 @@ class Llama4TextDecoderLayer(nn.Module):
             attention_mask = chunk_causal_mask
 
         # Self Attention
-        attention_states, self_attn_weights = self.self_attn(
+        attention_states, self_attn_weights, past_key_value = self.self_attn(
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
@@ -424,9 +424,11 @@ class Llama4TextDecoderLayer(nn.Module):
 
         if output_attentions:
             outputs += (self_attn_weights,)
-
+        if use_cache:
+            outputs += (past_key_value,)
         if output_router_logits:
             outputs += (router_logits,)
+
 
         return outputs
 
@@ -566,7 +568,7 @@ class Llama4TextModel(Llama4PreTrainedModel):
             # if output_hidden_states:
             #     all_hidden_states += (hidden_states,)
 
-            past_key_values = None
+            # past_key_values = None
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
@@ -597,6 +599,8 @@ class Llama4TextModel(Llama4PreTrainedModel):
                 )
 
             hidden_states = layer_outputs[0]
+            if use_cache:
+                past_key_values = layer_outputs[2 if output_attentions else 1]
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
