@@ -34,6 +34,7 @@ from modeling_llama_kv import LlamaForCausalLM
 from configs import EConfig
 from datasets import load_dataset
 import multiprocessing
+from utils import preprocess_conversations, convert_dataset
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(
@@ -540,105 +541,47 @@ class Model(nn.Module):
         for param in self.embed_tokens.parameters():
             param.requires_grad = False
 
-    def scandata(self, datapath, tokenizerpath, user_template, assistant_template):
+    def scandata(
+        self,
+        data,
+        tokenizerpath=None,
+        dataset_type: str = "custom",
+        assistant_header: str = "<|header_start|>assistant<|header_end|>\n\n",
+        user_header: str = "<|header_start|>user<|header_end|>",
+    ):
+        """Scan a pre-tokenized dataset or raw data path to compute vocab stats."""
         N = self.draft_vocab_size
         if not os.path.exists("cache.pt"):
-            tokenizer = AutoTokenizer.from_pretrained(tokenizerpath)
-            dataset = load_dataset('json', data_files=datapath)
-            dataset = dataset['train']
-            # dataset = dataset.select(range(96))
-            original_columns1 = dataset.column_names
-            num_proc = 1
+            if isinstance(data, str):
+                tokenizer = AutoTokenizer.from_pretrained(tokenizerpath)
+                dataset = load_dataset("json", data_files=data)["train"]
+                dataset = convert_dataset(dataset, dataset_type)
+                original_cols = dataset.column_names
 
-
-            def preprocess_function(examples):
-                new_examples = {
-                    # "conversation": [],
-                    "input_ids": [],
-                    "loss_mask": []
-                }
-                for i in range(len(examples['conversations'])):
-                    messages = [
-                        {"role": "system",
-                         "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
-                    ]
-                    convroles = ["user", "assistant"]
-                    source = examples['conversations'][i]
-                    if not source:
-                        continue
-                    if source[0]["role"] != "user":
-                        # Skip the first one if it is not from human
-                        source = source[1:]
-                    for j, sentence in enumerate(source):
-                        role = sentence["role"]
-                        assert role == convroles[j % 2], f"{i}"
-                        # if sentence["from"]=="gpt":
-                        #     sentence["value"]=" "+sentence["value"]
-                        messages.append(
-                            {"role": role, "content": sentence["content"]}
-                        )
-                    conversation = tokenizer.apply_chat_template(
-                        messages,
-                        tokenize=False,
-                        add_generation_prompt=False,
+                def preprocess_function(examples):
+                    return preprocess_conversations(
+                        tokenizer,
+                        examples["conversations"],
+                        return_attention_mask=False,
+                        assistant_header=assistant_header,
+                        user_header=user_header,
                     )
 
-                    if not tokenizer.pad_token_id:
-                        tokenizer.pad_token_id = tokenizer.unk_token_id
+                dataset = dataset.map(
+                    preprocess_function,
+                    batched=True,
+                    num_proc=1,
+                    remove_columns=original_cols,
+                    load_from_cache_file=False,
+                )
+                print("finished dataset")
+            else:
+                dataset = data
 
-                    encoding = tokenizer(
-                        conversation,
-                        return_tensors="pt",
-                        max_length=2048,
-                        add_special_tokens=False,
-                        return_offsets_mapping=True,
-                        truncation=True,
-                    )
-                    input_ids = encoding.input_ids[0]
-                    offsets = encoding.offset_mapping[0]
-                    loss_mask = torch.zeros_like(input_ids)
-                    
-                    assistant_header = "<|header_start|>assistant<|header_end|>\n\n"
-                    user_header = "<|header_start|>user<|header_end|>"
-                    end_of_turn_token = "<|eot|>"
-
-                    
-                    assistant_pattern = (
-                        re.escape(assistant_header) + r"(.*?)(?=" + re.escape(user_header) + "|" + re.escape(end_of_turn_token) + "|$)"
-                    )
-                    
-                    for match in re.finditer(assistant_pattern, conversation, re.DOTALL):
-                        assistant_start_char = match.start(1)
-                        assistant_end_char = match.end(1)
-                        
-                        for idx, (token_start, token_end) in enumerate(offsets):
-                            if token_end <= assistant_start_char:
-                                continue
-                            if token_start >= assistant_end_char:
-                                continue
-                            loss_mask[idx] = 1
-
-                    # new_examples["conversation"].append(conversation)
-                    new_examples["input_ids"].append(input_ids[None, :])
-                    new_examples["loss_mask"].append(loss_mask[None, :])
-
-                return new_examples
-
-            dataset = dataset.map(
-                preprocess_function,
-                batched=True,
-                num_proc=1,
-                remove_columns=original_columns1,
-                load_from_cache_file=False
-            )
-            print("finished dataset")
-            #dataset.set_format(type="torch")
-
-            num_processes = num_proc
+            num_processes = 1
             chunk_size = len(dataset) // num_processes + (len(dataset) % num_processes > 0)
             chunks = [dataset[i:i + chunk_size] for i in range(0, len(dataset), chunk_size)]
 
-            # 创建进程池
             results = [process_data(chunk) for chunk in chunks]
             print("finished process_data")
 

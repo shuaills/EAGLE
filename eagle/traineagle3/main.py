@@ -20,7 +20,7 @@ from lr_scheduler import CosineAnnealingWarmupLR
 from torch.optim import AdamW
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType, ShardingStrategy
-from utils import rank_0_priority
+from utils import rank_0_priority, preprocess_conversations, convert_dataset
 
 set_seed(0)
 
@@ -39,6 +39,12 @@ def parse_args():
     parser.add_argument('--testpath', type=str,
                         default="/home/lyh/code/nlp/developing/vllmbase/vllm/gedata/0318.json")
     parser.add_argument('--savedir', type=str, default='./output')
+    parser.add_argument('--dataset', type=str, default='custom',
+                        choices=['custom', 'sharegpt', 'ultrachat', 'mixture_of_thoughts'])
+    parser.add_argument('--assistant_header', type=str,
+                        default='<|header_start|>assistant<|header_end|>\n\n')
+    parser.add_argument('--user_header', type=str,
+                        default='<|header_start|>user<|header_end|>')
     return parser.parse_args()
 
 
@@ -52,107 +58,28 @@ def init_distributed():
     torch.cuda.set_device(dist.get_rank())
 
 def build_dataset_rank(
-        tokenizer, datapath
+        tokenizer,
+        datapath,
+        dataset_type: str = 'custom',
+        assistant_header: str = '<|header_start|>assistant<|header_end|>\n\n',
+        user_header: str = '<|header_start|>user<|header_end|>',
 ):
 
     ds = load_dataset('json', data_files=datapath)
     ds = ds['train']
     ds = ds.shuffle(seed=42)
-    ds1 = ds
+    ds1 = convert_dataset(ds, dataset_type)
     original_columns1 = ds1.column_names
     num_proc = 8
 
     def preprocess_function(examples):
-        new_examples = {
-            "attention_mask": [],
-            "input_ids": [],
-            "loss_mask": []
-        }
-        for i in range(len(examples['conversations'])):
-            messages = [
-                {"role": "system",
-                 "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
-            ]
-            convroles = ["user", "assistant"]
-            source = examples['conversations'][i]
-            if not source:
-                continue
-            if source[0]["role"] != "user":
-                # Skip the first one if it is not from human
-                source = source[1:]
-            for j, sentence in enumerate(source):
-                role = sentence["role"]
-                assert role == convroles[j % 2], f"{i}"
-                # if sentence["from"]=="gpt":
-                #     sentence["value"]=" "+sentence["value"]
-                messages.append(
-                    {"role": role, "content": sentence["content"]}
-                )
-            conversation = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-
-            if not tokenizer.pad_token_id:
-                tokenizer.pad_token_id = tokenizer.unk_token_id
-
-            input_ids = tokenizer(
-                conversation,
-                return_tensors="pt",
-                max_length=2048,
-                add_special_tokens=False,
-            ).input_ids[0]
-            loss_mask = torch.ones_like(input_ids)
-            # print(i)
-
-            sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-
-            total_len = len(input_ids)
-
-            sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
-            turns = conversation.split(sep2)
-
-            turns[1] = turns[0] + sep2 + turns[1]
-            turns = turns[1:]
-
-            cur_len = 1
-            loss_mask[:cur_len] = 0
-            for i, turn in enumerate(turns):
-                if turn == "":
-                    break
-                turn_len = len(tokenizer(turn).input_ids)
-
-                parts = turn.split(sep)
-                if len(parts) != 2:
-                    break
-                parts[0] += sep
-                # "-2" is hardcoded for the Llama tokenizer to make the offset correct.
-                instruction_len = len(tokenizer(parts[0]).input_ids) - 1
-
-                # Ignore the user instructions
-                if i == 0:
-                    loss_mask[cur_len: cur_len + instruction_len - 2] = 0
-                else:
-                    loss_mask[cur_len - 3: cur_len + instruction_len + 1] = 0
-                cur_len += turn_len
-                if i != 0:
-                    cur_len += 3
-                # cur_len+=2
-
-                # if i != 0 and not tokenizer.legacy:
-                #     # The legacy and non-legacy modes handle special tokens differently
-                #     cur_len -= 1
-
-            loss_mask[cur_len:] = 0
-            attention_mask = torch.ones_like(loss_mask)
-
-            # new_examples["conversation"].append(conversation)
-            new_examples["input_ids"].append(input_ids[None, :])
-            new_examples["loss_mask"].append(loss_mask[None, :])
-            new_examples["attention_mask"].append(attention_mask[None, :])
-
-        return new_examples
+        return preprocess_conversations(
+            tokenizer,
+            examples["conversations"],
+            return_attention_mask=True,
+            assistant_header=assistant_header,
+            user_header=user_header,
+        )
 
     ds1 = ds1.map(
         preprocess_function,
@@ -197,8 +124,20 @@ class DataCollatorWithPadding:
         return batch
 
 def prepare_dataloaders(args, tokenizer):
-    traindataset = build_dataset_rank(tokenizer, args.trainpath)
-    testdataset = build_dataset_rank(tokenizer, args.testpath)
+    traindataset = build_dataset_rank(
+        tokenizer,
+        args.trainpath,
+        dataset_type=args.dataset,
+        assistant_header=args.assistant_header,
+        user_header=args.user_header,
+    )
+    testdataset = build_dataset_rank(
+        tokenizer,
+        args.testpath,
+        dataset_type=args.dataset,
+        assistant_header=args.assistant_header,
+        user_header=args.user_header,
+    )
 
     # train
     world_size = dist.get_world_size()
@@ -212,7 +151,7 @@ def prepare_dataloaders(args, tokenizer):
     test_sampler = DistributedSampler(testdataset, num_replicas=world_size, rank=rank, shuffle=False)
     test_loader = DataLoader(testdataset, batch_size=args.batch_size, sampler=test_sampler, num_workers=4, pin_memory=True,
                              collate_fn=DataCollatorWithPadding())
-    return train_loader, test_loader, train_sampler, test_sampler
+    return train_loader, test_loader, train_sampler, test_sampler, traindataset
 
 
 def main():
@@ -227,13 +166,18 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.basepath)
 
     # build data
-    train_loader, test_loader, train_sampler, test_sampler = prepare_dataloaders(args, tokenizer)
+    train_loader, test_loader, train_sampler, test_sampler, train_dataset = prepare_dataloaders(args, tokenizer)
 
     # build model and apply fsdp
     config = EConfig.from_pretrained(args.config_path)
     model = Model(config, path=args.basepath, load_emb=True, load_head=True).to(torch.bfloat16)
     with rank_0_priority():
-        model.scandata(args.trainpath, args.basepath)
+        model.scandata(
+            train_dataset,
+            dataset_type=args.dataset,
+            assistant_header=args.assistant_header,
+            user_header=args.user_header,
+        )
     model = model.cuda()
     model = FSDP(model, use_orig_params=True, sharding_strategy=ShardingStrategy.SHARD_GRAD_OP)
     dist.barrier()
