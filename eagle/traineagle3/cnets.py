@@ -459,14 +459,18 @@ def padding(tensor, left=True):
 def process_data(data_chunk):
 
     token_dict = Counter()
-    input_ids = data_chunk["input_ids"]
-    loss_mask = data_chunk["loss_mask"]
-    for i in range(len(input_ids)):
-        ids= input_ids[i][0]
-        mask = loss_mask[i][0]
-        for j in range(len(ids)):
-            if mask[j] == 1:
-                token_dict[ids[j]] += 1
+
+    input_ids = torch.stack([ids for ids in data_chunk["input_ids"]]).cpu()
+    loss_mask = torch.stack([mask for mask in data_chunk["loss_mask"]]).cpu()
+
+    input_ids = input_ids.squeeze(1)
+    loss_mask = loss_mask.squeeze(1)
+
+    valid_tokens = input_ids[loss_mask == 1]
+
+    if valid_tokens.numel() > 0:
+        counts = torch.bincount(valid_tokens)
+        token_dict.update({i: int(c) for i, c in enumerate(counts.tolist()) if c > 0})
 
     return token_dict
 
