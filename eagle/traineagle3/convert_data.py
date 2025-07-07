@@ -11,26 +11,21 @@ def parse_args():
 
 
 def convert(args):
-    src_file = open(args.input_path, "r")
-    dst_file = open(args.output_path, "w")
+    with open(args.input_path, "r") as src_file, open(args.output_path, "w") as dst_file:
+        for line in src_file:
+            data = json.loads(line)
 
-    # iterate over src file
-    # change the format of the data
-    # write to dst file
-    for line in src_file:
-        data = json.loads(line)
-        
-        new_data = {
-            "conversations": []
-        }
+            new_data = {
+                "conversations": []
+            }
 
-        for item in data['conversations']:
-            new_data['conversations'].append({
-                "from": item['from'],
-                "value": item['value']
-            })
+            for item in data["conversations"]:
+                new_data["conversations"].append({
+                    "from": item["from"],
+                    "value": item["value"]
+                })
 
-        dst_file.write(json.dumps(new_data) + "\n")
+            dst_file.write(json.dumps(new_data) + "\n")
 
 if __name__ == "__main__":
     args = parse_args()
