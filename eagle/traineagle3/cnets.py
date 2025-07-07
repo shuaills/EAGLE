@@ -481,6 +481,24 @@ def merge_dicts(dicts):
     for d in dicts:
         result.update(d)
     return result
+
+
+def do_word_count(dataset, num_processes):
+    """Count token frequencies for a dataset using multiple processes."""
+    if num_processes < 1:
+        num_processes = 1
+
+    chunk_size = len(dataset) // num_processes + (len(dataset) % num_processes > 0)
+    chunks = [dataset[i:i + chunk_size] for i in range(0, len(dataset), chunk_size)]
+
+    if num_processes > 1:
+        with multiprocessing.Pool(num_processes) as pool:
+            results = pool.map(process_data, chunks)
+    else:
+        results = [process_data(chunk) for chunk in chunks]
+
+    return merge_dicts(results)
+
 class Model(nn.Module):
     def __init__(self, config, load_head=False, load_emb=True, path=None, target_model=None, type="language"):
         super().__init__()
@@ -582,16 +600,9 @@ class Model(nn.Module):
             else:
                 dataset = data
 
-            num_processes = 1
-            chunk_size = len(dataset) // num_processes + (len(dataset) % num_processes > 0)
-            chunks = [dataset[i:i + chunk_size] for i in range(0, len(dataset), chunk_size)]
-
-            results = [process_data(chunk) for chunk in chunks]
+            num_processes = 8
+            token_dict = do_word_count(dataset, num_processes)
             print("finished process_data")
-
-            # 合并结果
-            token_dict = merge_dicts(results)
-
 
             total_frequency = sum(token_dict.values())
             top_N = token_dict.most_common(N)
